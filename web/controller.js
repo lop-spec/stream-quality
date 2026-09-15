@@ -45,6 +45,7 @@
       connection = { url: StreamQuality.endpoint(url.href, ['127.0.0.1', 'localhost'].includes(url.hostname)), token: el('pair-token').value.trim() };
       if (!connection.token) throw Error('需要本次配对码');
       const data = await api('/v1/status'); selected = new Set(data.catalog.map(n => n.key)); version = -1; render(data);
+      el('endpoint').value = data.endpoint;
       el('pair-token').value = ''; el('pair').disabled = true; el('disconnect').disabled = false; el('start').disabled = true; await poll();
     } catch (error) { connection = null; status(`连接失败：${error.message}。手机不能使用电脑的 127.0.0.1；请使用私人 HTTPS 地址。`); }
   };

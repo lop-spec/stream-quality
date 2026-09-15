@@ -50,11 +50,12 @@ function createController(template, { run = runner.run, onEvent = () => {}, log 
       if (url.pathname === '/v1/cancel') { cancel(); send(202, { cancelling: !!active }); return; }
       if (url.pathname !== '/v1/run') { send(404, { error: 'not found' }); return; }
       if (active) { send(409, { error: 'one measurement at a time; stop or await the current job' }); return; }
+      if (Object.keys(input).some(key => !['rounds', 'keys'].includes(key))) { log('controller rejected unknown run fields'); send(400, { error: 'only rounds and cached-node keys are accepted' }); return; }
       const rounds = Number(input.rounds || 1), keys = input.keys || catalog.map(n => n.key);
       if (![1, 3].includes(rounds) || !Array.isArray(keys) || !keys.length || new Set(keys).size !== keys.length || keys.some(k => !catalog.some(n => n.key === k))) { send(400, { error: 'invalid rounds or cached-node selection' }); return; }
       const nodes = template.nodes.filter(n => keys.includes(n.key)), controller = new AbortController(), owned = { controller, promise: null };
       active = owned; state = { running: true, completed: 0, total: nodes.length * rounds, maxDownloadBytes: nodes.length * rounds * SQ.PROFILE.downloadBytes };
-      notify({ type: 'controller-state', ...state });
+      notify({ ...state, type: 'controller-state' });
       owned.promise = Promise.resolve().then(() => run({ ...template, nodes, rounds }, { signal: controller.signal, emit: event => {
         if (event.type === 'progress') state = { ...state, ...event };
         if (event.type === 'log') log(event.message); notify(event);
@@ -70,7 +71,7 @@ function createController(template, { run = runner.run, onEvent = () => {}, log 
         lastResult = { type: 'result', ok: false, error: error.message, outcomes: nodes.map(n => ({ key: n.key, value: { ok: false, failureScope: 'round', error: error.message } })) };
         for (const n of nodes) history[n.key] = { ...(history[n.key] || {}), lastAttempt: { status: 'error', error: error.message, measuredAt: Date.now() } };
         notify(lastResult);
-      }).finally(() => { active = null; state = { ...state, running: false, cancelled: controller.signal.aborted }; notify({ type: 'controller-state', ...state }); });
+      }).finally(() => { active = null; state = { ...state, running: false, cancelled: controller.signal.aborted }; notify({ ...state, type: 'controller-state' }); });
       send(202, { started: true, ...state });
     } catch (error) { log(`controller request failed: ${error.message}`); send(500, { error: 'controller request failed; see local log' }); }
   });

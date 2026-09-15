@@ -20,6 +20,7 @@ test('paired controller covers all nodes, protects credentials, serializes jobs 
   const before = await (await api('/v1/status')).json(); assert.equal(before.catalog.length, 2); assert.deepEqual(before.catalog[0].subscriptions, ['one','two']);
   assert.equal(JSON.stringify(before).includes('PRIVATE-FIXTURE'), false); assert.equal(JSON.stringify(before).includes(app.token), false);
   assert.equal((await api('/v1/run', { keys: ['unknown'] })).status, 400);
+  assert.equal((await api('/v1/run', { endpoint: 'https://attacker.invalid' })).status, 400);
   assert.equal((await api('/v1/run', { rounds: 3 })).status, 202); await started;
   assert.equal((await api('/v1/run', {})).status, 409); assert.equal(starts, 1);
   assert.equal((await api('/v1/cancel', {})).status, 202); await app.stop(); assert.equal(cancelled, true);
