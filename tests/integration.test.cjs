@@ -14,7 +14,7 @@ test('real 20s HTTP/SSE and exact 8MiB download through isolated local HTTP prox
   });
   await new Promise(r => proxy.listen(0, '127.0.0.1', r)); t.after(() => { proxy.closeAllConnections(); proxy.close(); });
   const start = Date.now(); const result = await runner.probe(`http://127.0.0.1:${origin.address().port}`, { port: proxy.address().port });
-  assert.equal(result.ok, true); assert.equal(result.stream.receivedSamples, 401); assert.equal(result.download.bytes, SQ.PROFILE.downloadBytes);
+  assert.equal(result.ok, true, JSON.stringify(result)); assert.equal(result.stream.receivedSamples, 401); assert.equal(result.download.bytes, SQ.PROFILE.downloadBytes);
   assert.equal(proxyRequests, 3); assert.ok(Date.now() - start >= 19900); assert.ok(result.stream.sourceSlipMs <= 250); assert.equal(result.stream.flowPass, true);
 });
 test('abort destroys an actual streaming socket within 1s', { timeout: 3000 }, async t => {

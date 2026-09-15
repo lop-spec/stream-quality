@@ -15,7 +15,18 @@ npm start
 npm test
 ```
 
-公网静态页面由 GitHub Pages 托管，测试源由 Cloudflare Worker 承载。网页测的是**当前浏览器网络到该端点**，并不能遍历代理订阅；手机也不等于在测电脑网络。Smart Proxy 使用同源执行器和独立 sing-box，测全部缓存节点，配置、端口、进程与日常核心分离。只有导出 JSON 时结果才写入下载文件；网页不接收订阅、模型凭据或节点密码。
+公网静态页面由 GitHub Pages 托管，测试源由 Cloudflare Worker 承载。网页有两种模式：**当前浏览器线路测速**与**遥控配对电脑的全部缓存订阅节点**。后者实际测的是电脑到节点，不是手机网络。独立 sing-box 的配置、端口、进程与日常核心分离。公开网页不接收订阅、模型凭据或节点密码；配对码仅存当前标签页内存。
+
+## 手机遥控全部节点
+
+1. Smart Proxy 1.4+ 点击「启动手机控制」；它复用全部指纹去重的订阅缓存（保留多订阅归属），在 `127.0.0.1:8799` 启动私人执行层，显示本次配对码。本地测速暂时互斥，日常代理完全不动。
+2. 让手机通过**私人 HTTPS 地址**访问这台电脑。例如电脑与手机已登录同一 Tailscale 尾网时，电脑一次配置 `tailscale serve --bg --yes --https=8444 http://127.0.0.1:8799`；使用 `https://电脑DNS名.ts.net:8444`。Serve 是私人尾网入口，不是 Funnel，不开放公网。未使用 Tailscale 时可以使用自行管理的 HTTPS 反代；不要把未加 TLS 的助手端口暴露公网。
+3. 手机打开上方 Pages 网页，填执行层 HTTPS 地址与配对码，即可全选、选部分节点、单次/3轮复测、取消实际任务，查看全部节点与历史成功。不要在手机填电脑的 `127.0.0.1`。
+4. 电脑停止手机控制会中止任务、回收自己的核心、关闭执行层并作废配对码；再次启动使用新码。Serve TLS 入口可以保留；撤销本端口用 `tailscale serve --https=8444 off`，不要 reset 其他服务。
+
+只有 Pages 不足以执行代理协议；手机必须能访问私人执行层。浏览器可能提示本地网络权限，拒绝时明确报错，不会静默改测手机。关闭页面不等于停止任务，请点「停止实际请求」或「停止并断开」。执行层不可达时不能保证取消已送达，页面会明确提醒在电脑停止。端点本身也可能需要代理网络可达。
+
+独立使用：`node controller.cjs --job /absolute/private/job.json`（保持 stdin 打开）。JSONL 的 `controller-ready` 含仅用于本次配对的秘密，宿主应只在本机界面展示，不写日志、不发布。控制接口只允许固定作业中已登记的节点，不接受远程核心路径、命令、节点密码或任意 URL；一个执行层最多一个作业。
 
 ## v1 固定协议
 
@@ -41,7 +52,7 @@ npm test
 
 `node stream-quality-runner.cjs --job /absolute/private/job.json`；从 stdin 接收 `{"action":"cancel"}` 后立即取消请求、停止队列并仅清理自己启动的核心，向 stdout 输出 JSONL start/progress/log/result。
 
-作业：`{ endpoint, rounds: 1|3, corePath, config, nodes: [{key, tag}] }`。`config` 是已转换的 sing-box 配置，节点必须已按指纹去重；执行器不自行解析各种订阅格式。运行时重新建立每节点专属 loopback 入站/路由，端口由系统分配，不启动 TUN、系统代理或控制器。缺失节点转换直接报错，不静默过滤。临时凭据配置不进入日志，在 finally 清理；调用方也应清理私有作业文件。没有 config 时可以传 `nodes: [{key, port}]` 使用已有测试通道。
+作业：`{ endpoint, rounds: 1|3, corePath, config, nodes: [{key, tag}] }`。`config` 是已转换的 sing-box 配置，节点必须已按指纹去重；执行器不自行解析各种订阅格式。运行时重新建立每节点专属 loopback 入站/路由，端口由系统分配，不启动 TUN、系统代理或控制器。缺失节点转换时逐节点明确报告 unsupported，其余受支持节点继续测速，不静默漏测。测速配置只保留选定出站及显式依赖，不载入其他 selector/urltest 的后台探测。临时凭据配置不进入日志，在 finally 清理；调用方也应清理私有作业文件。没有 config 时可以传 `nodes: [{key, port}]` 使用已有测试通道。
 
 取消或失败不产生新的合格成绩。历史结果保留/展示由宿主负责，Smart Proxy 使用独立新数据仓，不覆盖旧模型历史。源限流、协议不完整和端点漂移单独标注，不混成节点断网。
 

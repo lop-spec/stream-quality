@@ -81,7 +81,7 @@ async function probe(base, { port = 0, signal, onProgress = () => {} } = {}) {
   const parser = SQ.analyzer();
   await request(base, '/api/stream', { port, signal, maxBytes: P.samples * P.frameBytes + 4096,
     onHeaders: headers => { checkHeaders(headers); if (!headers['content-type']?.startsWith('text/event-stream')) throw failure('not SSE', 'measurement'); },
-    onData: (chunk, at) => parser.push(chunk, at) });
+    onData: (chunk, at) => { parser.push(chunk, at); if (parser.error) throw failure(parser.error, 'measurement'); } });
   const stream = parser.result();
   if (!stream.ok) return { ...stream, stream };
   onProgress('download');
@@ -102,15 +102,26 @@ async function reservePorts(count) {
     return reservations.map(s => s.address().port);
   } finally { await Promise.all(reservations.map(s => new Promise(resolve => s.close(resolve)))); }
 }
+function isolatedConfig(job, ports) {
+  const byTag = new Map(job.config.outbounds.map(o => [o.tag, o])), required = new Set(job.nodes.map(n => n.tag));
+  for (const server of job.config.dns?.servers || []) if (server.detour) required.add(server.detour);
+  for (const tag of required) {
+    const outbound = byTag.get(tag);
+    if (!outbound || ['selector', 'urltest'].includes(outbound.type)) throw failure('test route dependency is missing or would perform automatic selection/probing', 'round');
+    if (outbound.detour) required.add(outbound.detour);
+  }
+  return { log: { level: 'error', timestamp: false }, dns: job.config.dns,
+    outbounds: [...required].map(tag => byTag.get(tag)),
+    inbounds: ports.map((port, i) => ({ type: 'mixed', tag: `sq-in-${i}`, listen: '127.0.0.1', listen_port: port })),
+    route: { auto_detect_interface: true, default_domain_resolver: job.config.route?.default_domain_resolver,
+      rules: job.nodes.map((node, i) => ({ inbound: [`sq-in-${i}`], outbound: node.tag })), final: job.nodes[0].tag } };
+}
 async function startCore(job, signal, log) {
   if (!job.corePath || !path.isAbsolute(job.corePath)) throw failure('absolute sing-box corePath required', 'round');
   const tags = new Set((job.config?.outbounds || []).map(o => o.tag));
   if (!job.nodes.length || job.nodes.some(n => !tags.has(n.tag))) throw failure('some cached nodes were not converted to sing-box; no silent filtering', 'round');
-  const ports = await reservePorts(job.nodes.length), dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stream-quality-'));
-  const configPath = path.join(dir, 'probe.json');
-  const config = { log: { level: 'error', timestamp: false }, dns: job.config.dns,
-    outbounds: job.config.outbounds, inbounds: ports.map((port, i) => ({ type: 'mixed', tag: `sq-in-${i}`, listen: '127.0.0.1', listen_port: port })),
-    route: { ...job.config.route, rules: job.nodes.map((node, i) => ({ inbound: [`sq-in-${i}`], outbound: node.tag })), final: job.nodes[0].tag } };
+  const ports = await reservePorts(job.nodes.length), config = isolatedConfig(job, ports);
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'stream-quality-')), configPath = path.join(dir, 'probe.json');
   // No TUN, system proxy, controller, cache file, selector changes or daily-core operations.
   let child, exited = false, stderr = '', spawnError;
   const cleanup = async () => {
@@ -136,7 +147,7 @@ async function startCore(job, signal, log) {
         socket.setTimeout(200); const finish = value => { socket.destroy(); resolve(value); };
         socket.once('connect', () => finish(true)); socket.once('error', () => finish(false)); socket.once('timeout', () => finish(false));
       });
-      if (ready) return { ports, cleanup };
+      if (ready) return { ports, cleanup, pid: child.pid };
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     // Do not echo sing-box stderr: node credentials can occur in parser diagnostics.
@@ -146,6 +157,12 @@ async function startCore(job, signal, log) {
 function aggregate(samples, total, roundId) {
   const good = samples.filter(SQ.isResult);
   if (!good.length) return { ...(samples.at(-1) || { ok: false, failureScope: 'cancelled', error: 'not started' }), roundId };
+  if (good.length !== total) {
+    const failed = samples.find(s => !SQ.isResult(s));
+    return { ok: false, verified: false, failureScope: failed?.failureScope || 'measurement',
+      error: `${good.length}/${total} complete samples; ${failed?.error || 'incomplete round'}`, roundId,
+      successfulSamples: good.length, sampleCount: total, successRate: good.length / total };
+  }
   const profiles = new Set(good.map(s => s.profileKey));
   if (profiles.size > 1) return { ok: false, failureScope: 'endpoint', error: 'endpoint location changed between repetitions', roundId };
   const median = values => SQ.percentile(values, .5), worst = Math.max;
@@ -163,28 +180,38 @@ async function run(job, { signal = new AbortController().signal, emit = () => {}
   const rounds = Number(job.rounds || 1);
   if (![1, 3].includes(rounds) || nodes.length < 1 || nodes.length > 1000 || new Set(nodes.map(n => n.key)).size !== nodes.length) throw failure('invalid round count or duplicate/empty node list', 'round');
   const total = nodes.length * rounds, collected = new Map(nodes.map(n => [n.key, []]));
-  let core, completed = 0;
+  let core, channelFailure, completed = 0;
   const log = message => emit({ type: 'log', message });
+  const supported = job.config ? new Set((job.config.outbounds || []).filter(o => !['selector', 'urltest'].includes(o.type)).map(o => o.tag)) : null;
+  const eligible = supported ? nodes.filter(n => supported.has(n.tag)) : nodes;
+  const unsupported = nodes.filter(n => !eligible.includes(n));
+  for (const node of unsupported) collected.get(node.key).push({ ok: false, failureScope: 'unsupported', error: 'cached node protocol was not converted by the host; not a connection failure' });
+  if (unsupported.length) log(`${unsupported.length} unsupported cached node(s) explicitly reported; continuing with ${eligible.length} supported node(s)`);
+  completed += unsupported.length * rounds;
   try {
-    if (job.config) core = await startCore({ ...job, nodes }, signal, log);
-    emit({ type: 'start', roundId, profile: P.id, total, nodes: nodes.length, maxDownloadBytes: total * P.downloadBytes, concurrency: 1 });
-    for (let round = 0; round < rounds && !signal.aborted; round++) {
+    if (job.config && eligible.length) core = await startCore({ ...job, nodes: eligible }, signal, log);
+    const portByKey = new Map(eligible.map((n, i) => [n.key, core ? core.ports[i] : n.port]));
+    emit({ type: 'start', roundId, profile: P.id, total, nodes: nodes.length, unsupported: unsupported.length, maxDownloadBytes: eligible.length * rounds * P.downloadBytes, concurrency: 1, isolatedPid: core?.pid });
+    for (let round = 0; round < rounds && !signal.aborted && !channelFailure; round++) {
       // Rotate across nodes, not three consecutive trials on the same favorite.
       for (let offset = 0; offset < nodes.length && !signal.aborted; offset++) {
         const index = (offset + round) % nodes.length, node = nodes[index];
-        let value;
-        try { value = await probeFn(job.endpoint, { signal, port: core ? core.ports[index] : node.port,
-          onProgress: phase => emit({ type: 'progress', phase, key: node.key, completed, total, round: round + 1 }) }); }
-        catch (error) { value = { ok: false, failureScope: signal.aborted ? 'cancelled' : error.failureScope || 'node', error: signal.aborted ? 'cancelled' : error.message }; }
+        if (!portByKey.has(node.key)) continue;
+        let value, phase = 'manifest';
+        try { value = await probeFn(job.endpoint, { signal, port: portByKey.get(node.key),
+          onProgress: current => { phase = current; emit({ type: 'progress', phase, key: node.key, completed, total, round: round + 1 }); } }); }
+        catch (error) { value = { ok: false, phase, failureScope: signal.aborted ? 'cancelled' : error.failureScope || 'node', error: signal.aborted ? 'cancelled' : `${phase}: ${error.message}` }; }
         collected.get(node.key).push(value); completed++;
         if (!value.ok) log(`sample failed: ${value.failureScope}: ${value.error}`);
         emit({ type: 'progress', phase: 'sample-done', key: node.key, completed, total, round: round + 1 });
+        if (value.failureScope === 'endpoint') { channelFailure = value; log('endpoint failure stopped the remaining queue; unmeasured nodes are not blamed'); break; }
       }
     }
     const outcomes = nodes.map(node => ({ key: node.key, port: node.port, value: signal.aborted
       ? { ok: false, failureScope: 'cancelled', error: 'round cancelled; previous score retained', roundId }
+      : collected.get(node.key).length < rounds && channelFailure ? { ...channelFailure, ok: false, roundId }
       : aggregate(collected.get(node.key), rounds, roundId) }));
-    return { type: 'result', ok: true, cancelled: signal.aborted, roundId, outcomes, elapsedMs: Date.now() - started, activity: { maxActiveTotal: 1 } };
+    return { type: 'result', ok: true, cancelled: signal.aborted, channelFailure, roundId, outcomes, elapsedMs: Date.now() - started, activity: { maxActiveTotal: 1 } };
   } finally { await core?.cleanup(); }
 }
 async function cli() {
@@ -204,5 +231,5 @@ async function cli() {
   try { emit(await run(job, { signal: controller.signal, emit })); }
   finally { process.stdin.pause(); process.stdin.removeAllListeners(); process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
 }
-module.exports = { request, probe, aggregate, run, startCore };
+module.exports = { request, probe, aggregate, run, startCore, isolatedConfig };
 if (require.main === module) cli().catch(error => { process.stdout.write(JSON.stringify({ type: 'result', ok: false, failureScope: error.failureScope || 'round', error: error.message }) + '\n'); process.exitCode = 1; process.stdin.pause(); });

@@ -48,7 +48,7 @@ test('cancel ends queue and returns no publishable partial score', async () => {
 });
 test('partial success cannot be verified; endpoint locations never aggregate; passing flows tie', () => {
   const partial = runner.aggregate([sample(), { ok: false }, sample(30)], 3, 'r');
-  assert.equal(partial.verified, false); assert.equal(partial.stream.flowPass, false); assert.equal(partial.successRate, 2 / 3);
+  assert.equal(partial.ok, false); assert.equal(partial.verified, false); assert.equal(partial.successRate, 2 / 3);
   assert.equal(runner.aggregate([sample(), { ...sample(), profileKey: 'other-colo' }], 3, 'r').ok, false);
   assert.equal(SQ.compare(sample(10), sample(100)), 0);
 });

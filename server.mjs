@@ -3,7 +3,7 @@ import { Readable } from 'node:stream';
 import fs from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { handle } from './worker.mjs';
-const assets = new Map([['/', 'web/index.html'], ['/app.js', 'web/app.js'], ['/style.css', 'web/style.css'], ['/stream-quality.js', 'stream-quality.js']]);
+const assets = new Map([['/', 'web/index.html'], ['/app.js', 'web/app.js'], ['/controller.js', 'web/controller.js'], ['/style.css', 'web/style.css'], ['/stream-quality.js', 'stream-quality.js']]);
 export function createServer() {
   return http.createServer(async (req, res) => {
     try {

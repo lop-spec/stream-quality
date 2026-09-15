@@ -9,7 +9,7 @@ const clients = new Map();
 let active = 0;
 function headers(type) {
   return { 'content-type': type, 'cache-control': 'no-store, no-transform', 'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET, OPTIONS', 'access-control-expose-headers': 'x-stream-quality-profile, x-stream-quality-location, content-length',
+    'access-control-allow-methods': 'GET, OPTIONS', 'access-control-expose-headers': 'x-stream-quality-profile, x-stream-quality-location, content-length, content-encoding',
     'x-content-type-options': 'nosniff', 'x-stream-quality-profile': P.id };
 }
 export function handle(request, location = 'unspecified') {
