@@ -229,7 +229,12 @@ async function cli() {
   });
   if (args.includes('--job')) process.stdin.on('end', cancel);
   try { emit(await run(job, { signal: controller.signal, emit })); }
-  finally { process.stdin.pause(); process.stdin.removeAllListeners(); process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); }
+  finally {
+    // The native host waits for our exit before closing its write end. pause() alone
+    // leaves the Windows pipe alive and deadlocks that handshake after a result.
+    process.stdin.removeAllListeners(); process.stdin.destroy();
+    process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel);
+  }
 }
 module.exports = { request, probe, aggregate, run, startCore, isolatedConfig };
-if (require.main === module) cli().catch(error => { process.stdout.write(JSON.stringify({ type: 'result', ok: false, failureScope: error.failureScope || 'round', error: error.message }) + '\n'); process.exitCode = 1; process.stdin.pause(); });
+if (require.main === module) cli().catch(error => { process.stdout.write(JSON.stringify({ type: 'result', ok: false, failureScope: error.failureScope || 'round', error: error.message }) + '\n'); process.exitCode = 1; process.stdin.destroy(); });
