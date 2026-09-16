@@ -10,6 +10,12 @@ const { setMaxListeners } = require('node:events');
 const MAX_CONCURRENCY = 256;
 const P = SQ.PROFILE;
 const failure = (error, scope = 'node') => Object.assign(Error(error), { failureScope: scope });
+// Public source diagnostics only: never retain arbitrary headers, cookies or bodies.
+function sourceHeaders(headers = {}) {
+  const fields = { responseLocation: 'x-stream-quality-location', retryAfter: 'retry-after', cfRay: 'cf-ray' };
+  return Object.fromEntries(Object.entries(fields).flatMap(([field, name]) =>
+    typeof headers[name] === 'string' ? [[field, headers[name].slice(0, 256)]] : []));
+}
 // A session belongs to one node and one origin. It is never shared across lanes.
 function transportSession(base, port = 0) {
   const target = new URL(base), hostname = target.hostname.replace(/^\[|\]$/g, ''), pending = new Set(), sockets = new Set();
@@ -44,7 +50,10 @@ function request(base, route, { port = 0, signal, session, maxBytes, onData = ()
       const elapsedMs = performance.now() - start;
       if (!session || error) { response?.destroy(); req?.destroy(); connect?.destroy(); socket?.destroy(); agent?.destroy(); }
       if (session && error) session.destroy();
-      if (error) reject(error); else resolve({ bytes, elapsedMs, firstByteMs: firstAt ?? elapsedMs, transferMs: Math.max(.1, elapsedMs - (firstAt ?? elapsedMs)) });
+      if (error) {
+        error.requestContext = { route, ...(response ? { httpStatus: response.statusCode, ...sourceHeaders(response.headers) } : {}) };
+        reject(error);
+      } else resolve({ bytes, elapsedMs, firstByteMs: firstAt ?? elapsedMs, transferMs: Math.max(.1, elapsedMs - (firstAt ?? elapsedMs)) });
     };
     const abort = () => finish(failure('cancelled', 'cancelled'));
     const timer = setTimeout(() => finish(failure('request timed out')), P.timeoutMs);
@@ -98,10 +107,10 @@ function request(base, route, { port = 0, signal, session, maxBytes, onData = ()
 async function probe(base, { port = 0, signal, includeDownload = true, reuseConnections = false, onProgress = () => {} } = {}) {
   base = SQ.endpoint(base, ['127.0.0.1', 'localhost'].includes(new URL(base).hostname));
   const session = reuseConnections ? transportSession(base, port) : undefined;
+  let manifest, streamHeaders;
   try {
   let manifestText = '';
   await request(base, '/api/manifest', { port, signal, session, maxBytes: 8192, onData: chunk => { manifestText += chunk; } });
-  let manifest;
   try { manifest = JSON.parse(manifestText); } catch { throw failure('invalid manifest', 'endpoint'); }
   if (manifest.profile?.id !== P.id || Object.keys(P).some(key => manifest.profile[key] !== P[key])) throw failure('incompatible profile', 'endpoint');
   const checkHeaders = headers => {
@@ -111,10 +120,11 @@ async function probe(base, { port = 0, signal, includeDownload = true, reuseConn
   onProgress('stream');
   const parser = SQ.analyzer();
   await request(base, '/api/stream', { port, signal, session, maxBytes: P.samples * P.frameBytes + 4096,
-    onHeaders: headers => { checkHeaders(headers); if (!headers['content-type']?.startsWith('text/event-stream')) throw failure('not SSE', 'measurement'); },
+    onHeaders: headers => { streamHeaders = sourceHeaders(headers); checkHeaders(headers); if (!headers['content-type']?.startsWith('text/event-stream')) throw failure('not SSE', 'measurement'); },
     onData: (chunk, at) => { parser.push(chunk, at); if (parser.error) throw failure(parser.error, 'measurement'); } });
   const stream = parser.result();
-  if (!stream.ok) return { ...stream, stream };
+  if (!stream.ok) return { ...stream, stream, requestContext: { route: '/api/stream', httpStatus: 200,
+    ...streamHeaders, ...(typeof manifest.location === 'string' ? { manifestLocation: manifest.location.slice(0, 256) } : {}) } };
   if (!includeDownload) return { ok: true, metricKind: 'stream-quality-v1', measurement: 'sse-only', endpoint: base,
     location: manifest.location, profileKey: SQ.profileKey(base, manifest.location, false) + (reuseConnections ? '|keepalive' : ''),
     connectionMode: reuseConnections ? 'reused' : 'fresh', measuredAt: Date.now(), stream };
@@ -126,6 +136,9 @@ async function probe(base, { port = 0, signal, includeDownload = true, reuseConn
     connectionMode: reuseConnections ? 'reused' : 'fresh', measuredAt: Date.now(), stream,
     download: { ...download, ok: true, mbps: download.bytes * 8 / download.transferMs / 1000,
       endToEndMbps: download.bytes * 8 / download.elapsedMs / 1000, shortSample: download.transferMs < 1000 } };
+  } catch (error) {
+    if (typeof manifest?.location === 'string') error.requestContext = { ...error.requestContext, manifestLocation: manifest.location.slice(0, 256) };
+    throw error;
   } finally { session?.destroy(); }
 }
 async function reservePorts(count) {
@@ -259,8 +272,11 @@ async function run(job, { signal: parentSignal = new AbortController().signal, e
           let value, phase = 'manifest'; active++; peak = Math.max(peak, active);
           try { value = await probeFn(job.endpoint, { signal, nodeKey: node.key, port: portByKey.get(node.key), includeDownload, reuseConnections: job.reuseConnections === true,
             onProgress: current => { phase = current; emit({ type: 'progress', phase, key: node.key, completed, total, round: round + 1 }); } }); }
-          catch (error) { value = { ok: false, phase, failureScope: signal.aborted ? 'cancelled' : error.failureScope || 'node', error: signal.aborted ? 'cancelled' : `${phase}: ${error.message}` }; }
+          catch (error) { value = { ok: false, phase, failureScope: signal.aborted ? 'cancelled' : error.failureScope || 'node', error: signal.aborted ? 'cancelled' : `${phase}: ${error.message}`,
+            ...(error.requestContext ? { requestContext: error.requestContext } : {}) }; }
           finally { active--; }
+          // Copied endpoint failures keep the originating lane, not the unmeasured lane's identity.
+          if (value.requestContext) value = { ...value, requestContext: { ...value.requestContext, nodeKey: node.key } };
           collected.get(node.key).push(value); completed++;
           if (!value.ok) log(`sample failed: ${value.failureScope}: ${value.error}`);
           emit({ type: 'progress', phase: 'sample-done', key: node.key, completed, total, round: round + 1 });
