@@ -54,17 +54,21 @@ function createController(template, { run = runner.run, onEvent = () => {}, log 
       const rounds = Number(input.rounds || 1), keys = input.keys || catalog.map(n => n.key);
       if (![1, 3].includes(rounds) || !Array.isArray(keys) || !keys.length || new Set(keys).size !== keys.length || keys.some(k => !catalog.some(n => n.key === k))) { send(400, { error: 'invalid rounds or cached-node selection' }); return; }
       const nodes = template.nodes.filter(n => keys.includes(n.key)), controller = new AbortController(), owned = { controller, promise: null };
-      active = owned; state = { running: true, completed: 0, total: nodes.length * rounds, maxDownloadBytes: nodes.length * rounds * SQ.PROFILE.downloadBytes };
+      active = owned; state = { running: true, completed: 0, total: nodes.length * rounds, measurement: 'sse-only',
+        maxDownloadBytes: 0, maxSseBytes: nodes.length * rounds * (SQ.PROFILE.samples * SQ.PROFILE.frameBytes + 4096), concurrency: nodes.length };
       notify({ ...state, type: 'controller-state' });
-      owned.promise = Promise.resolve().then(() => run({ ...template, nodes, rounds }, { signal: controller.signal, emit: event => {
+      owned.promise = Promise.resolve().then(() => run({ ...template, nodes, rounds, includeDownload: false }, { signal: controller.signal, emit: event => {
         if (event.type === 'progress') state = { ...state, ...event };
         if (event.type === 'log') log(event.message); notify(event);
       } })).then(result => {
         lastResult = result;
         for (const { key, value } of result.outcomes || []) {
           const attempt = { status: value.ok ? 'done' : result.cancelled ? 'cancelled' : 'error', error: value.error, failureScope: value.failureScope, measuredAt: Date.now() };
-          history[key] = SQ.isResult(value) ? { ...value, lastAttempt: attempt }
-            : { ...(history[key] || {}), lastAttempt: attempt };
+          const previous = history[key];
+          const legacy = SQ.isResult(previous) && previous.measurement !== 'sse-only' ? previous : previous?.legacyDownloadResult;
+          history[key] = SQ.isResult(value) ? { ...value,
+            ...(value.measurement === 'sse-only' && legacy ? { legacyDownloadResult: legacy } : {}), lastAttempt: attempt }
+            : { ...(previous || {}), lastAttempt: attempt };
         }
         notify(result);
       }).catch(error => { log(`controller round failed: ${error.message}`); state.error = error.message;

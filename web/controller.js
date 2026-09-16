@@ -12,7 +12,7 @@
     const result = await response.json(); if (!response.ok) throw Error(result.error || `HTTP ${response.status}`); return result;
   }
   const status = message => { el('remote-status').textContent = message; };
-  function budget() { el('remote-budget').textContent = `选中 ${selected.size}/${current?.catalog.length || 0} 节点 · 下载上限约 ${(selected.size * Number(el('remote-rounds').value) * 8.1).toFixed(1)} MiB；串行执行。达标流式并列，Mbps 不参与流式排名。`; }
+  function budget() { el('remote-budget').textContent = `选中 ${selected.size}/${current?.catalog.length || 0} 节点 · SSE 负载上限约 ${(selected.size * Number(el('remote-rounds').value) * (StreamQuality.PROFILE.samples * StreamQuality.PROFILE.frameBytes + 4096) / 1048576).toFixed(1)} MiB（不含协议开销）；全节点并行，每轮完整采样20秒＋连接收尾，不下载测速。`; }
   function render(data) {
     current = data; el('remote-panel').hidden = false;
     el('remote-run').disabled = data.state.running; el('remote-stop').disabled = !data.state.running;
@@ -26,7 +26,7 @@
         name.textContent = node.label; label.append(check, name);
         const affiliations = document.createElement('small'); affiliations.textContent = node.subscriptions.join(' / ');
         const metric = document.createElement('p'), r = data.history[node.key];
-        metric.textContent = r?.ok ? `${r.stream.flowPass ? '流式达标' : '流式有波动'} · ${r.download.mbps.toFixed(1)} Mbps${r.download.shortSample ? '（短样本）' : ''} · ${r.verified ? '3/3 复测' : '单次初筛'} · ${r.location || ''}` : '尚无完整成功成绩';
+        metric.textContent = r?.ok ? `${r.stream.flowPass ? '流式达标' : '流式有波动'} · 抖动 ${r.stream.jitterMs?.toFixed(1) ?? '—'} ms · 首段 ${r.stream.firstSampleMs?.toFixed(0) ?? '—'} ms${r.download ? ` · 历史下载 ${r.download.mbps.toFixed(1)} Mbps` : ''} · ${r.verified ? '3/3 复测' : '单次初筛'} · ${r.location || ''}` : '尚无完整成功成绩';
         const attempt = document.createElement('small'); attempt.textContent = r?.lastAttempt?.status !== 'done' ? r?.lastAttempt?.error || '' : '';
         card.append(label, affiliations, metric, attempt); return card;
       }));
