@@ -4,6 +4,6 @@
   "description": "Fixed-workload streaming quality and bounded download measurement, without model calls",
   "license": "MIT",
   "engines": { "node": ">=22" },
-  "scripts": { "test": "node --test tests/*.test.cjs", "start": "node server.mjs", "probe": "node stream-quality-runner.cjs", "controller": "node controller.cjs" },
+  "scripts": { "test": "node --test --test-concurrency=1 tests/*.test.cjs", "start": "node server.mjs", "probe": "node stream-quality-runner.cjs", "controller": "node controller.cjs" },
   "files": ["stream-quality.js", "stream-quality-runner.cjs", "controller.cjs", "server.mjs", "worker.mjs", "web", "README.md", "LICENSE"]
 }
