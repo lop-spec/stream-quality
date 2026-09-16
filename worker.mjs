@@ -6,7 +6,9 @@ const noise = new Uint8Array(65536);
 let seed = 0x19af0731;
 for (let i = 0; i < noise.length; i++) { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; noise[i] = seed & 255; }
 const clients = new Map();
-let active = 0;
+// Keep bandwidth downloads separately bounded; low-rate SSE supports a whole node catalog.
+export const LIMITS = Object.freeze({ stream: { concurrent: 256, perMinute: 1024 }, download: { concurrent: 8, perMinute: 40 } });
+const active = { stream: 0, download: 0 };
 function headers(type) {
   return { 'content-type': type, 'cache-control': 'no-store, no-transform', 'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, OPTIONS', 'access-control-expose-headers': 'x-stream-quality-profile, x-stream-quality-location, content-length, content-encoding',
@@ -22,14 +24,15 @@ export function handle(request, location = 'unspecified') {
   if (!['/api/stream', '/api/download'].includes(url.pathname)) return new Response('Stream Quality endpoint. See /api/manifest', { status: 404, headers: headers('text/plain') });
   const ip = request.headers.get('cf-connecting-ip') || 'local', now = Date.now();
   for (const [key, entry] of clients) if (now - entry.at >= 60000) clients.delete(key);
-  const client = clients.get(ip) || { at: now, requests: 0 };
-  if (client.requests >= 40 || active >= 8 || clients.size >= 4096 && !clients.has(ip)) {
-    console.warn('stream-quality rate limit: source busy; not a node failure');
+  const kind = url.pathname === '/api/stream' ? 'stream' : 'download';
+  const client = clients.get(ip) || { at: now, stream: 0, download: 0 };
+  if (client[kind] >= LIMITS[kind].perMinute || active[kind] >= LIMITS[kind].concurrent || clients.size >= 4096 && !clients.has(ip)) {
+    console.warn(`stream-quality rate limit: ${kind} source busy; not a node failure`);
     return new Response('Source rate limited; retry later', { status: 429, headers: { ...headers('text/plain'), 'retry-after': '60' } });
   }
-  client.requests++; clients.set(ip, client); active++;
+  client[kind]++; clients.set(ip, client); active[kind]++;
   let settled = false, timer, wake;
-  const finish = () => { if (settled) return; settled = true; clearTimeout(timer); wake?.(); active--; };
+  const finish = () => { if (settled) return; settled = true; clearTimeout(timer); wake?.(); active[kind]--; };
   const h = { ...headers(url.pathname === '/api/stream' ? 'text/event-stream; charset=utf-8' : 'application/octet-stream'),
     'x-stream-quality-location': location, 'content-encoding': 'identity' };
   if (url.pathname === '/api/download') {

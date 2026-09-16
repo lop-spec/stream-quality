@@ -9,7 +9,7 @@ test('paired controller covers all nodes, protects credentials, serializes jobs 
   let begin, starts = 0, cancelled = false;
   const started = new Promise(r => { begin = r; });
   const app = createController({ ...template, history: { a: good } }, { log: () => {}, run: async (job, { signal }) => {
-    starts++; assert.equal(job.nodes.length, 2); begin(); await new Promise(r => signal.addEventListener('abort', r, { once: true })); cancelled = true;
+    starts++; assert.equal(job.nodes.length, 2); assert.equal(job.includeDownload, false); begin(); await new Promise(r => signal.addEventListener('abort', r, { once: true })); cancelled = true;
     return { type: 'result', ok: true, cancelled: true, outcomes: job.nodes.map(n => ({ key: n.key, value: { ok: false, failureScope: 'cancelled', error: 'cancelled' } })) };
   } });
   await new Promise(r => app.server.listen(0, '127.0.0.1', r)); t.after(async () => { await app.stop(); app.server.closeAllConnections(); app.server.close(); });
@@ -21,13 +21,34 @@ test('paired controller covers all nodes, protects credentials, serializes jobs 
   assert.equal(JSON.stringify(before).includes('PRIVATE-FIXTURE'), false); assert.equal(JSON.stringify(before).includes(app.token), false);
   assert.equal((await api('/v1/run', { keys: ['unknown'] })).status, 400);
   assert.equal((await api('/v1/run', { endpoint: 'https://attacker.invalid' })).status, 400);
-  assert.equal((await api('/v1/run', { rounds: 3 })).status, 202); await started;
+  const response = await api('/v1/run', { rounds: 3 }); assert.equal(response.status, 202);
+  const budget = await response.json(); assert.equal(budget.maxDownloadBytes, 0); assert.equal(budget.concurrency, 2); await started;
   assert.equal((await api('/v1/run', {})).status, 409); assert.equal(starts, 1);
   assert.equal((await api('/v1/cancel', {})).status, 202); await app.stop(); assert.equal(cancelled, true);
   const after = await (await api('/v1/status')).json(); assert.equal(after.state.running, false); assert.equal(after.history.a.download.mbps, 10); assert.equal(after.history.a.lastAttempt.status, 'cancelled');
 });
-test('endpoint faults stop remaining requests, rather than blaming every unmeasured node', async () => {
+test('endpoint faults allow active parallel samples to finish, stop later rounds and never blame nodes', async () => {
   let calls = 0;
   const result = await runRound({ endpoint: 'https://example.com', nodes: [{ key: 'a' }, { key: 'b' }], rounds: 3 }, { probeFn: async () => { calls++; return { ok: false, failureScope: 'endpoint', error: 'busy' }; } });
-  assert.equal(calls, 1); assert.equal(result.channelFailure.failureScope, 'endpoint'); assert.ok(result.outcomes.every(o => o.value.failureScope === 'endpoint'));
+  assert.equal(calls, 2); assert.equal(result.channelFailure.failureScope, 'endpoint'); assert.ok(result.outcomes.every(o => o.value.failureScope === 'endpoint'));
+});
+test('remote SSE-only success archives old download and preserves it on later failure', async t => {
+  let calls = 0;
+  const sse = { ...good, measurement: 'sse-only', profileKey: 'same|sse-only' }; delete sse.download;
+  const app = createController({ ...template, includeDownload: true, history: { a: good } }, { log: () => {}, run: async job => {
+    assert.equal(job.includeDownload, false); calls++;
+    return { type: 'result', ok: true, outcomes: [{ key: 'a', value: calls < 3 ? sse : { ok: false, failureScope: 'endpoint', error: 'source busy' } }] };
+  } });
+  await new Promise(r => app.server.listen(0, '127.0.0.1', r));
+  t.after(async () => { await app.stop(); app.server.closeAllConnections(); app.server.close(); });
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  const headers = { authorization: `Bearer ${app.token}` };
+  for (let i = 0; i < 3; i++) {
+    const started = await fetch(base + '/v1/run', { method: 'POST', headers, body: JSON.stringify({ keys: ['a'] }) });
+    assert.equal(started.status, 202); await started.json();
+    const status = await (await fetch(base + '/v1/status', { headers })).json();
+    assert.equal(status.history.a.measurement, 'sse-only'); assert.equal(status.history.a.download, undefined);
+    assert.equal(status.history.a.legacyDownloadResult.download.mbps, 10);
+    if (i === 2) assert.equal(status.history.a.lastAttempt.failureScope, 'endpoint');
+  }
 });

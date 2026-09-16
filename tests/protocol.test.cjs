@@ -32,12 +32,12 @@ test('HTTPS endpoint validation rejects embedded credentials and mutable query p
   assert.equal(SQ.endpoint('https://example.com/'), 'https://example.com');
 });
 const sample = (mbps = 10) => ({ ok: true, metricKind: 'stream-quality-v1', profileKey: 'same', stream: { ...simulate(), flowPass: true }, download: { ok: true, mbps, endToEndMbps: mbps - 1, shortSample: false } });
-test('three-pass interleaved scheduler is serial, tests every node and rotates order', async () => {
+test('three-pass SSE scheduler starts all nodes together, awaits each round and rotates launch order', async () => {
   const calls = []; let active = 0, max = 0;
   const result = await runner.run({ endpoint: 'https://example.com', nodes: [{ key: 'a', port: 1 }, { key: 'b', port: 2 }, { key: 'c', port: 3 }], rounds: 3 }, {
     probeFn: async (_url, { port }) => { active++; max = Math.max(max, active); calls.push(port); await new Promise(r => setTimeout(r, 1)); active--; return sample(port); }
   });
-  assert.deepEqual(calls, [1, 2, 3, 2, 3, 1, 3, 1, 2]); assert.equal(max, 1); assert.equal(result.outcomes.length, 3);
+  assert.deepEqual(calls, [1, 2, 3, 2, 3, 1, 3, 1, 2]); assert.equal(max, 3); assert.equal(result.activity.maxActiveTotal, 3); assert.equal(result.outcomes.length, 3);
   for (const { value } of result.outcomes) { assert.equal(value.verified, true); assert.equal(value.successRate, 1); }
 });
 test('cancel ends queue and returns no publishable partial score', async () => {

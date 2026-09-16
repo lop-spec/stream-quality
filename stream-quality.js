@@ -94,14 +94,15 @@
     }
     return url.href.replace(/\/+$/, '');
   }
-  function profileKey(base, location = '') { return `${PROFILE.id}|${base}|${location}`; }
-  function isResult(r) { return r?.metricKind === 'stream-quality-v1' && r.ok === true && r.stream?.ok === true && r.download?.ok === true; }
+  function profileKey(base, location = '', includeDownload = true) { return `${PROFILE.id}|${base}|${location}${includeDownload ? '' : '|sse-only'}`; }
+  function isResult(r) { return r?.metricKind === 'stream-quality-v1' && r.ok === true && r.stream?.ok === true
+    && (r.measurement === 'sse-only' || r.download?.ok === true); }
   function compare(a, b) {
     // Fixed-rate flows that meet the same limits are tied. Bandwidth is separate.
     return Number(!!b?.stream?.flowPass) - Number(!!a?.stream?.flowPass)
       || (a?.stream?.flowPass && b?.stream?.flowPass ? 0 : (a?.stream?.jitterMs ?? Infinity) - (b?.stream?.jitterMs ?? Infinity));
   }
-  async function browserProbe(base, { signal, onProgress = () => {} } = {}) {
+  async function browserProbe(base, { signal, onProgress = () => {}, includeDownload = false } = {}) {
     base = endpoint(base, new URL(base).hostname === '127.0.0.1' || new URL(base).hostname === 'localhost');
     const controller = new AbortController();
     const abort = () => controller.abort(); signal?.addEventListener('abort', abort, { once: true });
@@ -128,6 +129,9 @@
       while (true) { const { done, value } = await reader.read(); if (done) break; parser.push(value, performance.now() - start); if (parser.error) { await reader.cancel(); throw Error(parser.error); } }
       const stream = parser.result();
       if (!stream.ok) return { ...stream, stream };
+      const result = { ok: true, metricKind: 'stream-quality-v1', measurement: includeDownload ? 'sse-and-download' : 'sse-only',
+        endpoint: base, location: manifest.location || 'unspecified', profileKey: profileKey(base, manifest.location, includeDownload), measuredAt: Date.now(), stream };
+      if (!includeDownload) return result;
       onProgress('download');
       const ds = performance.now(), dr = await request('/api/download');
       if (!dr.ok || dr.headers.get('x-stream-quality-profile') !== PROFILE.id) throw Error(`download HTTP ${dr.status} / profile mismatch`);
@@ -138,8 +142,7 @@
       const finished = performance.now();
       if (bytes !== PROFILE.downloadBytes) throw Error('download truncated');
       const transferMs = Math.max(.1, finished - firstAt), elapsedMs = finished - ds;
-      return { ok: true, metricKind: 'stream-quality-v1', endpoint: base, location: manifest.location || 'unspecified',
-        profileKey: profileKey(base, manifest.location), measuredAt: Date.now(), stream,
+      return { ...result,
         download: { ok: true, bytes, elapsedMs: round(elapsedMs), transferMs: round(transferMs),
           mbps: round(bytes * 8 / transferMs / 1000), endToEndMbps: round(bytes * 8 / elapsedMs / 1000), shortSample: transferMs < 1000 } };
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); controller.abort(); }
