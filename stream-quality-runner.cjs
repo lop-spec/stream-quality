@@ -12,7 +12,7 @@ const P = SQ.PROFILE;
 const failure = (error, scope = 'node') => Object.assign(Error(error), { failureScope: scope });
 // A session belongs to one node and one origin. It is never shared across lanes.
 function transportSession(base, port = 0) {
-  const target = new URL(base), pending = new Set(), sockets = new Set();
+  const target = new URL(base), hostname = target.hostname.replace(/^\[|\]$/g, ''), pending = new Set(), sockets = new Set();
   const agent = new (target.protocol === 'https:' ? https.Agent : http.Agent)({ keepAlive: true, maxSockets: 1, maxFreeSockets: 1 });
   let closed = false;
   if (port && target.protocol === 'https:') agent.createConnection = (_options, callback) => {
@@ -25,7 +25,7 @@ function transportSession(base, port = 0) {
       if (res.statusCode !== 200) { pending.delete(connect); raw.destroy(); ready(failure(`proxy CONNECT HTTP ${res.statusCode}`)); return; }
       sockets.add(raw); raw.once('close', () => sockets.delete(raw));
       if (head.length) raw.unshift(head);
-      const socket = tls.connect({ socket: raw, servername: net.isIP(target.hostname) ? undefined : target.hostname, rejectUnauthorized: true });
+      const socket = tls.connect({ socket: raw, host: hostname, servername: net.isIP(hostname) ? undefined : hostname, rejectUnauthorized: true });
       sockets.add(socket); socket.once('close', () => sockets.delete(socket));
       socket.once('secureConnect', () => { pending.delete(connect); ready(null, socket); });
       socket.on('error', error => { pending.delete(connect); ready(error); });
@@ -36,7 +36,7 @@ function transportSession(base, port = 0) {
 }
 function request(base, route, { port = 0, signal, session, maxBytes, onData = () => {}, onHeaders = () => {} } = {}) {
   return new Promise((resolve, reject) => {
-    const target = new URL(base + route), start = performance.now();
+    const target = new URL(base + route), hostname = target.hostname.replace(/^\[|\]$/g, ''), start = performance.now();
     if (session && (session.origin !== target.origin || session.port !== port)) { reject(failure('transport session route mismatch', 'round')); return; }
     let agent, connect, socket, req, response, settled = false, bytes = 0, firstAt;
     const finish = error => {
@@ -64,7 +64,7 @@ function request(base, route, { port = 0, signal, session, maxBytes, onData = ()
           if (settled) { raw.destroy(); return; }
           if (res.statusCode !== 200) { const error = failure(`proxy CONNECT HTTP ${res.statusCode}`); ready(error); finish(error); return; }
           if (head.length) raw.unshift(head);
-          socket = tls.connect({ socket: raw, servername: net.isIP(target.hostname) ? undefined : target.hostname, rejectUnauthorized: true }, () => ready(null, socket));
+          socket = tls.connect({ socket: raw, host: hostname, servername: net.isIP(hostname) ? undefined : hostname, rejectUnauthorized: true }, () => ready(null, socket));
           socket.on('error', error => { ready(error); finish(error); });
         });
         connect.end();
