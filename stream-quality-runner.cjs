@@ -247,7 +247,7 @@ async function run(job, { signal: parentSignal = new AbortController().signal, e
         while (cursor < ordered.length && !signal.aborted && !channelFailure) {
           const node = ordered[cursor++];
           let value, phase = 'manifest'; active++; peak = Math.max(peak, active);
-          try { value = await probeFn(job.endpoint, { signal, port: portByKey.get(node.key), includeDownload, reuseConnections: job.reuseConnections === true,
+          try { value = await probeFn(job.endpoint, { signal, nodeKey: node.key, port: portByKey.get(node.key), includeDownload, reuseConnections: job.reuseConnections === true,
             onProgress: current => { phase = current; emit({ type: 'progress', phase, key: node.key, completed, total, round: round + 1 }); } }); }
           catch (error) { value = { ok: false, phase, failureScope: signal.aborted ? 'cancelled' : error.failureScope || 'node', error: signal.aborted ? 'cancelled' : `${phase}: ${error.message}` }; }
           finally { active--; }

@@ -10,8 +10,8 @@ const good = () => ({ok:true,metricKind:'stream-quality-v1',measurement:'sse-onl
 test('bounded lanes cover all nodes and preserve three successive observation rounds',async()=>{
  let active=0,peak=0;const counts=new Map(),done=[];
  const result=await runner.run({endpoint:'https://example.test',nodes:nodes(19),rounds:3,includeDownload:false,concurrency:4},{
-  probeFn:async(_url,{port,includeDownload})=>{
-   assert.equal(includeDownload,false);const count=(counts.get(port)||0)+1;
+  probeFn:async(_url,{port,nodeKey,includeDownload})=>{
+   assert.equal(nodeKey,`n${port}`);assert.equal(includeDownload,false);const count=(counts.get(port)||0)+1;
    if(count>1)assert.ok([...counts.values()].every(v=>v>=count-1));
    counts.set(port,count);peak=Math.max(peak,++active);await new Promise(r=>setTimeout(r,2));active--;done.push(port);return good();
   }});
