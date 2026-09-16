@@ -162,8 +162,18 @@ async function startCore(job, signal, log) {
   let child, exited = false, stderr = '', spawnError;
   const cleanup = async () => {
     if (child && !exited) {
-      child.kill();
-      await Promise.race([new Promise(resolve => child.once('exit', resolve)), new Promise(resolve => setTimeout(resolve, 2000))]);
+      let deadline, onExit;
+      try {
+        await new Promise(resolve => {
+          onExit = resolve;
+          child.once('exit', onExit);
+          deadline = setTimeout(resolve, 2000);
+          child.kill();
+        });
+      } finally {
+        clearTimeout(deadline);
+        child.removeListener('exit', onExit);
+      }
       if (!exited) { log('owned test core did not stop promptly'); child.kill('SIGKILL'); }
     }
     await fs.unlink(configPath).catch(error => { if (error.code !== 'ENOENT') log(`private temporary config cleanup failed: ${error.code}`); });
