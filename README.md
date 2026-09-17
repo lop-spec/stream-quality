@@ -2,7 +2,35 @@
 
 [手机网页](https://lop-spec.github.io/stream-quality/) · 固定负载流式质量 + 有界下载吞吐。**不调用模型，不读取模型账户，不把 Mbps 换算成 tok/s。**
 
-## 快速使用
+## 当前开发方向：本地SSE模拟原型（未验收）
+
+目标是**所有真实节点总墙钟（含启动、清理）≤60秒，准确度不下降**。Cloudflare专用源和20秒×3轮不是此目标的要求；下文v1只保留兼容/历史说明，不再据此继续云端调优。本地实验入口为 `scripts/local-sse-prototype.cjs`，尚未接入日常客户端、手机控制或正式成绩库。
+
+原型复用现有runner的 `startCore()` / `isolatedConfig()`，每节点独立loopback入站与指定出站；本地按调用者明确给出的节奏生成含随机ID、序号和结束标记的定长SSE文本帧，经HTTP CONNECT隧道发送到普通TCP echo对端，逐字节核验真实返回数据。没有PING、HTTP延迟代替SSE、预先缓存后匀速播放、默认公网服务或direct回退。节点列表不截断；超时/取消/不支持/未测逐项保留，外层墙钟不取整，包含清理。
+
+**能力边界必须保留：**
+
+- RFC 862 echo只回送收到的字节；SSE帧、发帧节奏与统计都在本地，不需要远端SSE定时生成器。但真正跨公网测代理仍需要一个可达回包对端，并不是纯本地回环就能测真实节点。
+- 原型测的是**双向SSE载荷回送**，并非HTTP `text/event-stream`响应。上行缓冲、echo服务延迟、下行缓冲能产生相同返回轨迹，不能据此分离纯下行SSE抖动、HTTP中间层缓冲或AI服务首字时间。
+- 结果永久标记本原型的 `sseDownlinkVerified:false`、`qualityPass:null`、`accuracy:unvalidated`、`acceptance:false`。`ok`仅表示完整收到本次随机载荷和end帧，不能作为节点优劣评分；旧 `StreamQuality.isResult()`明确拒收该metricKind。
+- 帧大小、间隔、样本数、drain时间和并发必须显式提供；没有把原v1阈值搬成新准确度标准。报告本地发帧偏移与事件循环停顿，不把本机延迟归因到代理节点。
+- 本机对照覆盖选路、200ms卡顿、整段缓冲释放、断流、篡改、普通HTTP响应、静默对端、取消、总预算和173条**本地fixture**线路。另可用已有sing-box核心验证真实协议转发/独立出站映射；这些都不是173个真实订阅节点的公网验收。
+
+零依赖本机验证（只连本机测试进程，无订阅/密码/公网负载）：
+
+```sh
+node --test tests/local-sse-prototype.test.cjs
+# 可选：指向已有获授权的核心；只起临时隔离实例，不下载/重启日常核心。
+SQ_TEST_CORE_PATH=/absolute/path/to/existing/sing-box node --test tests/local-sse-prototype.test.cjs
+```
+
+显式实验作业可通过 `node scripts/local-sse-prototype.cjs --job JOB.json` 运行。格式包含 `target:{host,port}`、`workload:{samples,intervalMs,frameBytes,drainMs}`、完整 `nodes`、`concurrency`、`wallBudgetMs<=60000`；既可传每节点专属 `port`，也可按旧runner格式传 `corePath/config/tag`。没有自动选择公网echo目标；任何新增公网负载或暴露本机服务仍需相应授权。原型入口不打包进v1发行文件，也不会修改生产设置。
+
+尚未完成：真实全目录≤60秒、单向SSE质量与准确度等价证明、正式界面集成。本机fixture完成速度不能用于宣布这些指标达标。
+
+参考：[Echo Protocol / RFC 862](https://www.rfc-editor.org/rfc/rfc862.txt)、[Node 22 net](https://nodejs.org/docs/latest-v22.x/api/net.html)。2026-09-17检索近一年更新的TCP echo实现并核对原理；微信近三个月检索无合格结果。未采用第三方echo代码或对其公开服务发起测速。
+
+## v1快速使用（历史/兼容路径，不是本地原型）
 
 Node.js 22+，零 npm 依赖：
 
