@@ -5,25 +5,63 @@ const http = require('node:http'), https = require('node:https'), tls = require(
 const fs = require('node:fs/promises'), path = require('node:path'), os = require('node:os');
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
-const { performance } = require('node:perf_hooks');
+const { performance, monitorEventLoopDelay } = require('node:perf_hooks');
+const { setMaxListeners } = require('node:events');
+const MAX_CONCURRENCY = 256;
 const P = SQ.PROFILE;
 const failure = (error, scope = 'node') => Object.assign(Error(error), { failureScope: scope });
-function request(base, route, { port = 0, signal, maxBytes, onData = () => {}, onHeaders = () => {} } = {}) {
+// Public source diagnostics only: never retain arbitrary headers, cookies or bodies.
+function sourceHeaders(headers = {}) {
+  const fields = { responseLocation: 'x-stream-quality-location', retryAfter: 'retry-after', cfRay: 'cf-ray' };
+  return Object.fromEntries(Object.entries(fields).flatMap(([field, name]) =>
+    typeof headers[name] === 'string' ? [[field, headers[name].slice(0, 256)]] : []));
+}
+// A session belongs to one node and one origin. It is never shared across lanes.
+function transportSession(base, port = 0) {
+  const target = new URL(base), hostname = target.hostname.replace(/^\[|\]$/g, ''), pending = new Set(), sockets = new Set();
+  const agent = new (target.protocol === 'https:' ? https.Agent : http.Agent)({ keepAlive: true, maxSockets: 1, maxFreeSockets: 1 });
+  let closed = false;
+  if (port && target.protocol === 'https:') agent.createConnection = (_options, callback) => {
+    let called = false;
+    const ready = (error, socket) => { if (called) return; called = true; callback(error, socket); };
+    const connect = http.request({ host: '127.0.0.1', port, method: 'CONNECT', path: `${target.hostname}:${target.port || 443}`, agent: false });
+    pending.add(connect); connect.on('error', error => { pending.delete(connect); ready(error); });
+    connect.on('connect', (res, raw, head) => {
+      if (closed) { raw.destroy(); ready(failure('session closed', 'cancelled')); return; }
+      if (res.statusCode !== 200) { pending.delete(connect); raw.destroy(); ready(failure(`proxy CONNECT HTTP ${res.statusCode}`)); return; }
+      sockets.add(raw); raw.once('close', () => sockets.delete(raw));
+      if (head.length) raw.unshift(head);
+      const socket = tls.connect({ socket: raw, host: hostname, servername: net.isIP(hostname) ? undefined : hostname, rejectUnauthorized: true });
+      sockets.add(socket); socket.once('close', () => sockets.delete(socket));
+      socket.once('secureConnect', () => { pending.delete(connect); ready(null, socket); });
+      socket.on('error', error => { pending.delete(connect); ready(error); });
+    });
+    connect.end();
+  };
+  return { agent, origin: target.origin, port, destroy() { closed = true; for (const req of pending) req.destroy(); for (const socket of sockets) socket.destroy(); agent.destroy(); } };
+}
+function request(base, route, { port = 0, signal, session, maxBytes, onData = () => {}, onHeaders = () => {} } = {}) {
   return new Promise((resolve, reject) => {
-    const target = new URL(base + route), start = performance.now();
+    const target = new URL(base + route), hostname = target.hostname.replace(/^\[|\]$/g, ''), start = performance.now();
+    if (session && (session.origin !== target.origin || session.port !== port)) { reject(failure('transport session route mismatch', 'round')); return; }
     let agent, connect, socket, req, response, settled = false, bytes = 0, firstAt;
     const finish = error => {
       if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort);
       const elapsedMs = performance.now() - start;
-      response?.destroy(); req?.destroy(); connect?.destroy(); socket?.destroy(); agent?.destroy();
-      if (error) reject(error); else resolve({ bytes, elapsedMs, firstByteMs: firstAt ?? elapsedMs, transferMs: Math.max(.1, elapsedMs - (firstAt ?? elapsedMs)) });
+      if (!session || error) { response?.destroy(); req?.destroy(); connect?.destroy(); socket?.destroy(); agent?.destroy(); }
+      if (session && error) session.destroy();
+      if (error) {
+        error.requestContext = { route, ...(response ? { httpStatus: response.statusCode, ...sourceHeaders(response.headers) } : {}) };
+        reject(error);
+      } else resolve({ bytes, elapsedMs, firstByteMs: firstAt ?? elapsedMs, transferMs: Math.max(.1, elapsedMs - (firstAt ?? elapsedMs)) });
     };
     const abort = () => finish(failure('cancelled', 'cancelled'));
     const timer = setTimeout(() => finish(failure('request timed out')), P.timeoutMs);
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) { abort(); return; }
     const options = { method: 'GET', headers: { 'accept-encoding': 'identity', 'cache-control': 'no-cache', 'user-agent': 'stream-quality/1.0' } };
-    if (port && target.protocol === 'https:') {
+    if (session) options.agent = session.agent;
+    else if (port && target.protocol === 'https:') {
       agent = new https.Agent({ keepAlive: false });
       agent.createConnection = (_options, callback) => {
         let called = false;
@@ -35,7 +73,7 @@ function request(base, route, { port = 0, signal, maxBytes, onData = () => {}, o
           if (settled) { raw.destroy(); return; }
           if (res.statusCode !== 200) { const error = failure(`proxy CONNECT HTTP ${res.statusCode}`); ready(error); finish(error); return; }
           if (head.length) raw.unshift(head);
-          socket = tls.connect({ socket: raw, servername: net.isIP(target.hostname) ? undefined : target.hostname, rejectUnauthorized: true }, () => ready(null, socket));
+          socket = tls.connect({ socket: raw, host: hostname, servername: net.isIP(hostname) ? undefined : hostname, rejectUnauthorized: true }, () => ready(null, socket));
           socket.on('error', error => { ready(error); finish(error); });
         });
         connect.end();
@@ -59,18 +97,22 @@ function request(base, route, { port = 0, signal, maxBytes, onData = () => {}, o
           catch (error) { finish(error); }
         });
         res.on('end', () => finish());
-        res.on('aborted', () => finish(failure('truncated response')));
+        // A valid SSE response can be cut by the source itself. Without its
+        // terminal event, do not turn that ambiguous failure into a bad node.
+        res.on('aborted', () => finish(failure('truncated response', route === '/api/stream' ? 'measurement' : 'node')));
         res.on('error', finish);
       });
       req.on('error', finish); req.end();
     } catch (error) { finish(error); }
   });
 }
-async function probe(base, { port = 0, signal, onProgress = () => {} } = {}) {
+async function probe(base, { port = 0, signal, includeDownload = true, reuseConnections = false, onProgress = () => {} } = {}) {
   base = SQ.endpoint(base, ['127.0.0.1', 'localhost'].includes(new URL(base).hostname));
+  const session = reuseConnections ? transportSession(base, port) : undefined;
+  let manifest, streamHeaders;
+  try {
   let manifestText = '';
-  await request(base, '/api/manifest', { port, signal, maxBytes: 8192, onData: chunk => { manifestText += chunk; } });
-  let manifest;
+  await request(base, '/api/manifest', { port, signal, session, maxBytes: 8192, onData: chunk => { manifestText += chunk; } });
   try { manifest = JSON.parse(manifestText); } catch { throw failure('invalid manifest', 'endpoint'); }
   if (manifest.profile?.id !== P.id || Object.keys(P).some(key => manifest.profile[key] !== P[key])) throw failure('incompatible profile', 'endpoint');
   const checkHeaders = headers => {
@@ -79,18 +121,27 @@ async function probe(base, { port = 0, signal, onProgress = () => {} } = {}) {
   };
   onProgress('stream');
   const parser = SQ.analyzer();
-  await request(base, '/api/stream', { port, signal, maxBytes: P.samples * P.frameBytes + 4096,
-    onHeaders: headers => { checkHeaders(headers); if (!headers['content-type']?.startsWith('text/event-stream')) throw failure('not SSE', 'measurement'); },
+  await request(base, '/api/stream', { port, signal, session, maxBytes: P.samples * P.frameBytes + 4096,
+    onHeaders: headers => { streamHeaders = sourceHeaders(headers); checkHeaders(headers); if (!headers['content-type']?.startsWith('text/event-stream')) throw failure('not SSE', 'measurement'); },
     onData: (chunk, at) => { parser.push(chunk, at); if (parser.error) throw failure(parser.error, 'measurement'); } });
   const stream = parser.result();
-  if (!stream.ok) return { ...stream, stream };
+  if (!stream.ok) return { ...stream, stream, requestContext: { route: '/api/stream', httpStatus: 200,
+    ...streamHeaders, ...(typeof manifest.location === 'string' ? { manifestLocation: manifest.location.slice(0, 256) } : {}) } };
+  if (!includeDownload) return { ok: true, metricKind: 'stream-quality-v1', measurement: 'sse-only', endpoint: base,
+    location: manifest.location, profileKey: SQ.profileKey(base, manifest.location, false) + (reuseConnections ? '|keepalive' : ''),
+    connectionMode: reuseConnections ? 'reused' : 'fresh', measuredAt: Date.now(), stream };
   onProgress('download');
-  const download = await request(base, '/api/download', { port, signal, maxBytes: P.downloadBytes, onHeaders: checkHeaders });
+  const download = await request(base, '/api/download', { port, signal, session, maxBytes: P.downloadBytes, onHeaders: checkHeaders });
   if (download.bytes !== P.downloadBytes) throw failure('download truncated');
   return { ok: true, metricKind: 'stream-quality-v1', endpoint: base, location: manifest.location,
-    profileKey: SQ.profileKey(base, manifest.location), measuredAt: Date.now(), stream,
+    profileKey: SQ.profileKey(base, manifest.location) + (reuseConnections ? '|keepalive' : ''),
+    connectionMode: reuseConnections ? 'reused' : 'fresh', measuredAt: Date.now(), stream,
     download: { ...download, ok: true, mbps: download.bytes * 8 / download.transferMs / 1000,
       endToEndMbps: download.bytes * 8 / download.elapsedMs / 1000, shortSample: download.transferMs < 1000 } };
+  } catch (error) {
+    if (typeof manifest?.location === 'string') error.requestContext = { ...error.requestContext, manifestLocation: manifest.location.slice(0, 256) };
+    throw error;
+  } finally { session?.destroy(); }
 }
 async function reservePorts(count) {
   const reservations = [];
@@ -126,8 +177,18 @@ async function startCore(job, signal, log) {
   let child, exited = false, stderr = '', spawnError;
   const cleanup = async () => {
     if (child && !exited) {
-      child.kill();
-      await Promise.race([new Promise(resolve => child.once('exit', resolve)), new Promise(resolve => setTimeout(resolve, 2000))]);
+      let deadline, onExit;
+      try {
+        await new Promise(resolve => {
+          onExit = resolve;
+          child.once('exit', onExit);
+          deadline = setTimeout(resolve, 2000);
+          child.kill();
+        });
+      } finally {
+        clearTimeout(deadline);
+        child.removeListener('exit', onExit);
+      }
       if (!exited) { log('owned test core did not stop promptly'); child.kill('SIGKILL'); }
     }
     await fs.unlink(configPath).catch(error => { if (error.code !== 'ENOENT') log(`private temporary config cleanup failed: ${error.code}`); });
@@ -163,24 +224,31 @@ function aggregate(samples, total, roundId) {
       error: `${good.length}/${total} complete samples; ${failed?.error || 'incomplete round'}`, roundId,
       successfulSamples: good.length, sampleCount: total, successRate: good.length / total };
   }
-  const profiles = new Set(good.map(s => s.profileKey));
+  const profiles = new Set(good.map(s => `${s.profileKey}|${s.measurement || 'sse-and-download'}`));
   if (profiles.size > 1) return { ok: false, failureScope: 'endpoint', error: 'endpoint location changed between repetitions', roundId };
   const median = values => SQ.percentile(values, .5), worst = Math.max;
   const stream = { ...good[0].stream, flowPass: good.length === total && good.every(s => s.stream.flowPass) };
   for (const key of ['firstSampleMs', 'jitterMs', 'p95ExtraGapMs', 'deliveryMs']) stream[key] = median(good.map(s => s.stream[key]));
   for (const key of ['maxExtraGapMs', 'longestGapMs', 'stallCount', 'burstRatio', 'sourceSlipMs', 'tailGrowthMs']) stream[key] = worst(...good.map(s => s.stream[key]));
-  return { ...good.at(-1), stream, download: { ...good.at(-1).download, mbps: median(good.map(s => s.download.mbps)),
-    endToEndMbps: median(good.map(s => s.download.endToEndMbps)), shortSample: good.some(s => s.download.shortSample) },
+  const download = good[0].measurement === 'sse-only' ? {} : { download: { ...good.at(-1).download, mbps: median(good.map(s => s.download.mbps)),
+    endToEndMbps: median(good.map(s => s.download.endToEndMbps)), shortSample: good.some(s => s.download.shortSample) } };
+  return { ...good.at(-1), stream, ...download,
     roundId, sampleCount: total, successfulSamples: good.length, successRate: good.length / total,
     verified: total >= 3 && good.length === total, samples: samples.map(s => ({ ok: s.ok, error: s.error, failureScope: s.failureScope,
       firstSampleMs: s.stream?.firstSampleMs, jitterMs: s.stream?.jitterMs, maxExtraGapMs: s.stream?.maxExtraGapMs, mbps: s.download?.mbps })) };
 }
-async function run(job, { signal = new AbortController().signal, emit = () => {}, probeFn = probe } = {}) {
-  const started = Date.now(), roundId = randomUUID(), nodes = job.nodes || [{ key: 'current-route', port: Number(job.port || 0) }];
-  const rounds = Number(job.rounds || 1);
+async function run(job, { signal: parentSignal = new AbortController().signal, emit = () => {}, probeFn = probe } = {}) {
+  const started = performance.now(), roundId = randomUUID(), nodes = job.nodes || [{ key: 'current-route', port: Number(job.port || 0) }];
+  const rounds = Number(job.rounds || 1), includeDownload = job.includeDownload !== false;
+  const requestedConcurrency = job.concurrency ?? MAX_CONCURRENCY;
   if (![1, 3].includes(rounds) || nodes.length < 1 || nodes.length > 1000 || new Set(nodes.map(n => n.key)).size !== nodes.length) throw failure('invalid round count or duplicate/empty node list', 'round');
+  if (!Number.isInteger(requestedConcurrency) || requestedConcurrency < 1 || requestedConcurrency > MAX_CONCURRENCY) throw failure('concurrency must be an integer from 1 to 256', 'round');
   const total = nodes.length * rounds, collected = new Map(nodes.map(n => [n.key, []]));
-  let core, channelFailure, completed = 0;
+  const owned = new AbortController(), signal = owned.signal, cancel = () => owned.abort();
+  setMaxListeners(MAX_CONCURRENCY + 2, signal);
+  parentSignal.addEventListener('abort', cancel, { once: true }); if (parentSignal.aborted) cancel();
+  const lag = monitorEventLoopDelay({ resolution: 20 });
+  let core, channelFailure, completed = 0, active = 0, peak = 0;
   const log = message => emit({ type: 'log', message });
   const supported = job.config ? new Set((job.config.outbounds || []).filter(o => !['selector', 'urltest'].includes(o.type)).map(o => o.tag)) : null;
   const eligible = supported ? nodes.filter(n => supported.has(n.tag)) : nodes;
@@ -191,34 +259,66 @@ async function run(job, { signal = new AbortController().signal, emit = () => {}
   try {
     if (job.config && eligible.length) core = await startCore({ ...job, nodes: eligible }, signal, log);
     const portByKey = new Map(eligible.map((n, i) => [n.key, core ? core.ports[i] : n.port]));
-    emit({ type: 'start', roundId, profile: P.id, total, nodes: nodes.length, unsupported: unsupported.length, maxDownloadBytes: eligible.length * rounds * P.downloadBytes, concurrency: 1, isolatedPid: core?.pid });
+    const concurrency = Math.min(eligible.length, includeDownload ? 1 : requestedConcurrency);
+    emit({ type: 'start', roundId, profile: P.id, total, nodes: nodes.length, unsupported: unsupported.length,
+      measurement: includeDownload ? 'sse-and-download' : 'sse-only', concurrency, isolatedPid: core?.pid,
+      maxSseBytes: eligible.length * rounds * (P.samples * P.frameBytes + 4096), maxDownloadBytes: includeDownload ? eligible.length * rounds * P.downloadBytes : 0 });
+    lag.enable(); await new Promise(resolve => setImmediate(resolve));
     for (let round = 0; round < rounds && !signal.aborted && !channelFailure; round++) {
-      // Rotate across nodes, not three consecutive trials on the same favorite.
-      for (let offset = 0; offset < nodes.length && !signal.aborted; offset++) {
-        const index = (offset + round) % nodes.length, node = nodes[index];
-        if (!portByKey.has(node.key)) continue;
-        let value, phase = 'manifest';
-        try { value = await probeFn(job.endpoint, { signal, port: portByKey.get(node.key),
-          onProgress: current => { phase = current; emit({ type: 'progress', phase, key: node.key, completed, total, round: round + 1 }); } }); }
-        catch (error) { value = { ok: false, phase, failureScope: signal.aborted ? 'cancelled' : error.failureScope || 'node', error: signal.aborted ? 'cancelled' : `${phase}: ${error.message}` }; }
-        collected.get(node.key).push(value); completed++;
-        if (!value.ok) log(`sample failed: ${value.failureScope}: ${value.error}`);
-        emit({ type: 'progress', phase: 'sample-done', key: node.key, completed, total, round: round + 1 });
-        if (value.failureScope === 'endpoint') { channelFailure = value; log('endpoint failure stopped the remaining queue; unmeasured nodes are not blamed'); break; }
+      // Repetitions retain successive 20s observation windows. Only different nodes overlap.
+      const ordered = eligible.map((_, i) => eligible[(i + round) % eligible.length]);
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < ordered.length && !signal.aborted && !channelFailure) {
+          const node = ordered[cursor++];
+          let value, phase = 'manifest'; active++; peak = Math.max(peak, active);
+          try { value = await probeFn(job.endpoint, { signal, nodeKey: node.key, port: portByKey.get(node.key), includeDownload, reuseConnections: job.reuseConnections === true,
+            onProgress: current => { phase = current; emit({ type: 'progress', phase, key: node.key, completed, total, round: round + 1 }); } }); }
+          catch (error) { value = { ok: false, phase, failureScope: signal.aborted ? 'cancelled' : error.failureScope || 'node', error: signal.aborted ? 'cancelled' : `${phase}: ${error.message}`,
+            ...(error.requestContext ? { requestContext: error.requestContext } : {}) }; }
+          finally { active--; }
+          // Copied endpoint failures keep the originating lane, not the unmeasured lane's identity.
+          if (value.requestContext) value = { ...value, requestContext: { ...value.requestContext, nodeKey: node.key } };
+          collected.get(node.key).push(value); completed++;
+          if (!value.ok) log(`sample failed: ${value.failureScope}: ${value.error}`);
+          emit({ type: 'progress', phase: 'sample-done', key: node.key, completed, total, round: round + 1 });
+          if (value.failureScope === 'endpoint' && !channelFailure) {
+            channelFailure = value; log('endpoint failure: finish active samples, skip queued nodes and later rounds; unmeasured nodes are not blamed');
+          }
+        }
+      };
+      const workers = [];
+      for (let i = 0; i < concurrency; i++) {
+        workers.push(worker());
+        // Let socket/timer callbacks run while opening a large catalog, instead
+        // of blocking the sampler with one synchronous connection-start burst.
+        if ((i + 1) % 8 === 0) await new Promise(resolve => setTimeout(resolve, 1));
       }
+      await Promise.all(workers);
     }
-    const outcomes = nodes.map(node => ({ key: node.key, port: node.port, value: signal.aborted
-      ? { ok: false, failureScope: 'cancelled', error: 'round cancelled; previous score retained', roundId }
+    lag.disable();
+    const maxClientLagMs = Math.max(0, lag.max / 1e6 - 20);
+    const localFailure = maxClientLagMs > P.jitterPassMs ? { ok: false, failureScope: 'measurement', roundId,
+      error: `local event loop stalled ${maxClientLagMs.toFixed(1)}ms; cannot attribute run to node quality` } : null;
+    if (localFailure) log(localFailure.error);
+    const outcomes = nodes.map(node => ({ key: node.key, port: node.port, value: !portByKey.has(node.key)
+      ? aggregate(collected.get(node.key), rounds, roundId)
+      : signal.aborted ? { ok: false, failureScope: 'cancelled', error: 'round cancelled; previous score retained', roundId }
+      : localFailure ? localFailure
       : collected.get(node.key).length < rounds && channelFailure ? { ...channelFailure, ok: false, roundId }
       : aggregate(collected.get(node.key), rounds, roundId) }));
-    return { type: 'result', ok: true, cancelled: signal.aborted, channelFailure, roundId, outcomes, elapsedMs: Date.now() - started, activity: { maxActiveTotal: 1 } };
-  } finally { await core?.cleanup(); }
+    // The reported wall clock includes owned-core cleanup, not just the last response.
+    await core?.cleanup(); core = undefined;
+    return { type: 'result', ok: true, cancelled: signal.aborted, channelFailure, roundId, outcomes,
+      elapsedMs: Math.round(performance.now() - started), activity: { maxActiveTotal: peak, maxClientLagMs } };
+  } finally { lag.disable(); parentSignal.removeEventListener('abort', cancel); await core?.cleanup(); }
 }
 async function cli() {
   const args = process.argv.slice(2), value = flag => args.includes(flag) ? args[args.indexOf(flag) + 1] : undefined;
   const job = args.includes('--job') ? JSON.parse(await fs.readFile(value('--job'), 'utf8'))
-    : { endpoint: value('--endpoint'), port: Number(value('--port') || 0), rounds: Number(value('--rounds') || 1) };
-  if (!job.endpoint) throw failure('usage: node stream-quality-runner.cjs --endpoint HTTPS_URL [--port LOCAL_PROXY_PORT] [--rounds 1|3]', 'round');
+    : { endpoint: value('--endpoint'), port: Number(value('--port') || 0), rounds: Number(value('--rounds') || 1),
+      includeDownload: !args.includes('--sse-only'), concurrency: value('--concurrency') === undefined ? undefined : Number(value('--concurrency')) };
+  if (!job.endpoint) throw failure('usage: node stream-quality-runner.cjs --endpoint HTTPS_URL [--port LOCAL_PROXY_PORT] [--rounds 1|3] [--sse-only] [--concurrency 1..256]', 'round');
   const controller = new AbortController(), emit = event => process.stdout.write(JSON.stringify(event) + '\n');
   let input = '';
   const cancel = () => controller.abort();
@@ -236,5 +336,5 @@ async function cli() {
     process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel);
   }
 }
-module.exports = { request, probe, aggregate, run, startCore, isolatedConfig };
+module.exports = { request, probe, aggregate, run, startCore, isolatedConfig, transportSession };
 if (require.main === module) cli().catch(error => { process.stdout.write(JSON.stringify({ type: 'result', ok: false, failureScope: error.failureScope || 'round', error: error.message }) + '\n'); process.exitCode = 1; process.stdin.destroy(); });

@@ -94,8 +94,9 @@
     }
     return url.href.replace(/\/+$/, '');
   }
-  function profileKey(base, location = '') { return `${PROFILE.id}|${base}|${location}`; }
-  function isResult(r) { return r?.metricKind === 'stream-quality-v1' && r.ok === true && r.stream?.ok === true && r.download?.ok === true; }
+  function profileKey(base, location = '', includeDownload = true) { return `${PROFILE.id}|${base}|${location}${includeDownload ? '' : '|sse-only'}`; }
+  function isResult(r) { return r?.metricKind === 'stream-quality-v1' && r.ok === true && r.stream?.ok === true
+    && (r.measurement === 'sse-only' || r.download?.ok === true); }
   function compare(a, b) {
     // Fixed-rate flows that meet the same limits are tied. Bandwidth is separate.
     return Number(!!b?.stream?.flowPass) - Number(!!a?.stream?.flowPass)
