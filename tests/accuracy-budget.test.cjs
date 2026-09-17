@@ -23,3 +23,28 @@ test('three successive complete observation windows already consume the entire 6
  assert.equal((SQ.PROFILE.samples-1)*SQ.PROFILE.intervalMs,20000);
  assert.equal(3*SQ.PROFILE.durationMs,60000);assert.equal(SQ.PROFILE.samples,401);
 });
+const {model}=require('../scripts/model-sse-schedule.cjs');
+test('all 519 modeled observations retain their full workload; 256 slots still need at least three 20s waves',()=>{
+ const serial=model({startupMs:250,cleanupMs:250});
+ const overlap256=model({concurrency:256,serializeNode:false,startupMs:250,cleanupMs:250});
+ for(const plan of [serial,overlap256]){
+  assert.equal(plan.totalTasks,519);assert.equal(plan.totalSampleFrames,208119);
+  assert.equal(new Set(plan.tasks.map(t=>`${t.node}:${t.round}`)).size,519);
+  assert.ok(plan.tasks.every(t=>t.end-t.start===20000&&t.samples===401));
+  assert.equal(plan.workloadFloorMs,60000);assert.equal(plan.modeledWallMs,60500);
+ }
+ assert.equal(serial.exposurePerNodeMs.min,60000);
+ assert.equal(Math.ceil(519/2),260,'at least 260 slots needed for two ideal waves, even before transport overhead');
+ assert.equal(model({concurrency:260,serializeNode:false}).workloadFloorMs,40000);
+});
+for(const concurrency of [256,260,519])test(`overlapping full 20s trials at ${concurrency} slots can still miss a time-local fault seen by serial trials`,()=>{
+ const serial=model(),overlap=model({concurrency,serializeNode:false});
+ const results=plan=>plan.tasks.filter(t=>t.node===0).map(t=>analyze(SQ.PROFILE,
+  i=>100+(t.start+i*SQ.PROFILE.intervalMs>=45000?1000:0)));
+ const slow=results(serial),fast=results(overlap);
+ assert.ok([...slow,...fast].every(r=>r.ok&&r.receivedSamples===401&&r.sourceSlipMs===0));
+ assert.equal(slow.every(r=>r.flowPass),false);
+ assert.equal(fast.every(r=>r.flowPass),true);
+ // A deterministic counterexample, not a measured production false-negative rate.
+ assert.ok(overlap.exposurePerNodeMs.min<serial.exposurePerNodeMs.min);
+});

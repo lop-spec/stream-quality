@@ -97,7 +97,9 @@ function request(base, route, { port = 0, signal, session, maxBytes, onData = ()
           catch (error) { finish(error); }
         });
         res.on('end', () => finish());
-        res.on('aborted', () => finish(failure('truncated response')));
+        // A valid SSE response can be cut by the source itself. Without its
+        // terminal event, do not turn that ambiguous failure into a bad node.
+        res.on('aborted', () => finish(failure('truncated response', route === '/api/stream' ? 'measurement' : 'node')));
         res.on('error', finish);
       });
       req.on('error', finish); req.end();
